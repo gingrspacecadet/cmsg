@@ -1,8 +1,9 @@
 #include "common.h"
 
 typedef struct {
-    int  fd;
-    char name[MAXNAME];  /* if name[0] == '\0', we haven’t read it yet */
+    int   fd;
+    char  name[MAXNAME];    /* if name[0] == '\0', we haven’t read username yet */
+    char  channel[MAXCHAN]; /* current channel for this client */
 } client_t;
 
 static int       listenfd = -1;
@@ -55,7 +56,8 @@ int main_server(const char *port_str) {
     /* 2) Initialize client array */
     for (int i = 0; i < MAXCLIENTS; i++) {
         clients[i].fd = -1;
-        clients[i].name[0] = '\0';
+        clients[i].name[0]    = '\0';
+        clients[i].channel[0] = '\0';
     }
 
     FD_ZERO(&allset);
@@ -72,7 +74,7 @@ int main_server(const char *port_str) {
             fatal("select");
         }
 
-        /* --- New connection? --- */
+        /* --- New incoming connection? --- */
         if (FD_ISSET(listenfd, &rset)) {
             struct sockaddr_in cliaddr;
             socklen_t cli_len = sizeof cliaddr;
@@ -80,12 +82,14 @@ int main_server(const char *port_str) {
             if (connfd < 0) {
                 perror("accept");
             } else {
-                /* Find a free slot */
+                /* Find a free client slot */
                 int i;
                 for (i = 0; i < MAXCLIENTS; i++) {
                     if (clients[i].fd < 0) {
-                        clients[i].fd = connfd;
-                        clients[i].name[0] = '\0';  /* not set yet */
+                        clients[i].fd              = connfd;
+                        clients[i].name[0]         = '\0';           /* username not known yet */
+                        strncpy(clients[i].channel, "general", MAXCHAN);
+                        clients[i].channel[MAXCHAN - 1] = '\0';
                         break;
                     }
                 }
@@ -97,94 +101,131 @@ int main_server(const char *port_str) {
                     if (connfd > maxfd) maxfd = connfd;
                     char addrbuf[INET_ADDRSTRLEN];
                     inet_ntop(AF_INET, &cliaddr.sin_addr, addrbuf, sizeof addrbuf);
-                    fprintf(stdout, "New connection from %s:%d (fd=%d)\n",
+                    fprintf(stdout,
+                            "New connection from %s:%d → assigned fd=%d (channel='general')\n",
                             addrbuf, ntohs(cliaddr.sin_port), connfd);
-                    /* Now we expect the next line from this fd to be the username. */
+                    /* Next read from this fd is expected to be the username line. */
                 }
             }
             if (--nready <= 0) continue;
         }
 
-        /* --- Check existing clients --- */
+        /* --- Check existing clients for data --- */
         for (int i = 0; i < MAXCLIENTS; i++) {
             int sockfd = clients[i].fd;
             if (sockfd < 0) continue;
+            if (!FD_ISSET(sockfd, &rset)) continue;
 
-            if (FD_ISSET(sockfd, &rset)) {
-                char buf[MAXLINE];
-                ssize_t n = read(sockfd, buf, MAXLINE - 1);
-                if (n <= 0) {
-                    /* Disconnection or error */
-                    if (n == 0) {
-                        /* Inform others that this user left (if they had a name) */
-                        if (clients[i].name[0] != '\0') {
-                            char leave_msg[MAXLINE];
-                            snprintf(leave_msg, sizeof leave_msg, 
-                                     "*** %s has left ***\n", clients[i].name);
-                            for (int j = 0; j < MAXCLIENTS; j++) {
-                                if (clients[j].fd >= 0 && clients[j].fd != sockfd) {
-                                    write(clients[j].fd, leave_msg, strlen(leave_msg));
-                                }
+            char buf[MAXLINE];
+            ssize_t n = read(sockfd, buf, MAXLINE - 1);
+            if (n <= 0) {
+                /* Client disconnected or error */
+                if (n == 0) {
+                    if (clients[i].name[0] != '\0') {
+                        /* Announce “<username> left” to everyone in the same channel */
+                        char leave_msg[MAXLINE];
+                        snprintf(leave_msg, sizeof leave_msg,
+                                 "*** %s has left %s ***\n",
+                                 clients[i].name, clients[i].channel);
+                        for (int j = 0; j < MAXCLIENTS; j++) {
+                            if (clients[j].fd >= 0
+                                && j != i
+                                && strcmp(clients[j].channel, clients[i].channel) == 0)
+                            {
+                                write(clients[j].fd, leave_msg, strlen(leave_msg));
                             }
-                            fprintf(stdout, "Client '%s' (fd=%d) disconnected\n",
-                                    clients[i].name, sockfd);
-                        } else {
-                            fprintf(stdout, "Unnamed client (fd=%d) disconnected before naming\n",
-                                    sockfd);
                         }
+                        fprintf(stdout, "Client '%s' (fd=%d) disconnected from channel '%s'\n",
+                                clients[i].name, sockfd, clients[i].channel);
                     } else {
-                        perror("read");
+                        fprintf(stdout,
+                                "Unnamed client (fd=%d) disconnected before setting username\n",
+                                sockfd);
                     }
-                    close(sockfd);
-                    FD_CLR(sockfd, &allset);
-                    clients[i].fd = -1;
-                    clients[i].name[0] = '\0';
                 } else {
-                    buf[n] = '\0';
-                    /* Trim trailing newline */
-                    if (buf[n-1] == '\n') buf[n-1] = '\0';
+                    perror("read");
+                }
+                close(sockfd);
+                FD_CLR(sockfd, &allset);
+                clients[i].fd = -1;
+                clients[i].name[0]    = '\0';
+                clients[i].channel[0] = '\0';
+            } else {
+                buf[n] = '\0';
+                /* Trim trailing newline if present */
+                if (buf[n - 1] == '\n') {
+                    buf[n - 1] = '\0';
+                    n--;
+                }
 
-                    if (clients[i].name[0] == '\0') {
-                        /* First message from this socket is the username */
-                        strncpy(clients[i].name, buf, MAXNAME - 1);
-                        clients[i].name[MAXNAME - 1] = '\0';
-                        /* Announce to others */
-                        char join_msg[MAXLINE];
-                        snprintf(join_msg, sizeof join_msg,
-                                 "*** %s has joined ***\n", clients[i].name);
-                        for (int j = 0; j < MAXCLIENTS; j++) {
-                            if (clients[j].fd >= 0 && clients[j].fd != sockfd) {
-                                write(clients[j].fd, join_msg, strlen(join_msg));
-                            }
+                /* 1) If this client has no name yet, treat this line as the username */
+                if (clients[i].name[0] == '\0') {
+                    /* Save username (up to MAXNAME-1 chars) */
+                    strncpy(clients[i].name, buf, MAXNAME - 1);
+                    clients[i].name[MAXNAME - 1] = '\0';
+                    /* Announce join to everyone already in “general” (since that’s the only channel) */
+                    char join_msg[MAXLINE];
+                    snprintf(join_msg, sizeof join_msg,
+                             "*** %s has joined %s ***\n",
+                             clients[i].name, clients[i].channel);
+                    for (int j = 0; j < MAXCLIENTS; j++) {
+                        if (clients[j].fd >= 0
+                            && j != i
+                            && strcmp(clients[j].channel, clients[i].channel) == 0)
+                        {
+                            write(clients[j].fd, join_msg, strlen(join_msg));
                         }
-                        fprintf(stdout, "Client fd=%d is now known as '%s'\n",
-                                sockfd, clients[i].name);
+                    }
+                    fprintf(stdout, "Client fd=%d is now known as '%s' in channel '%s'\n",
+                            sockfd, clients[i].name, clients[i].channel);
+                }
+                /* 2) Otherwise, parse this line as “<channel>:<message>” */
+                else {
+                    /* Expect exactly one colon separating channel name from message */
+                    char *colon = strchr(buf, ':');
+                    if (!colon) {
+                        /* Malformed—ignore silently or send error back to client?
+                           For simplicity, we just ignore it. */
                     } else {
-                        /* A normal chat message: prefix with "name: " */
-                        char outbuf[MAXLINE];
-                        int m = snprintf(outbuf, sizeof outbuf, "%s: %s\n",
-                                         clients[i].name, buf);
-                        if (m < 0) m = 0;
-                        if (m >= (int)sizeof outbuf) m = (int)sizeof outbuf - 1;
+                        size_t clen = colon - buf;
+                        if (clen >= MAXCHAN) clen = MAXCHAN - 1;
+                        char   chanbuf[MAXCHAN];
+                        strncpy(chanbuf, buf, clen);
+                        chanbuf[clen] = '\0';
 
-                        /* Broadcast to *all other* clients */
-                        for (int j = 0; j < MAXCLIENTS; j++) {
-                            int outfd = clients[j].fd;
-                            if (outfd >= 0 && outfd != sockfd) {
-                                if (write(outfd, outbuf, m) < 0) {
-                                    perror("write to client");
+                        /* Only broadcast if the channel matches the sender’s stored channel */
+                        if (strcmp(chanbuf, clients[i].channel) == 0) {
+                            /* Build “username: message\n” for broadcast */
+                            const char *msgbody = colon + 1;
+                            char outbuf[MAXLINE];
+                            int  m = snprintf(
+                                outbuf, sizeof outbuf,
+                                "%s: %s\n", clients[i].name, msgbody
+                            );
+                            if (m < 0) m = 0;
+                            if (m >= (int)sizeof outbuf) m = (int)sizeof outbuf - 1;
+
+                            /* Send to every other client whose channel == chanbuf */
+                            for (int j = 0; j < MAXCLIENTS; j++) {
+                                if (clients[j].fd >= 0
+                                    && j != i
+                                    && strcmp(clients[j].channel, chanbuf) == 0)
+                                {
+                                    write(clients[j].fd, outbuf, m);
                                 }
                             }
+                            fprintf(stdout, "[%s@%s] %s\n",
+                                    clients[i].name, chanbuf, msgbody);
                         }
-                        fprintf(stdout, "[%s] %s\n", clients[i].name, buf);
+                        /* else: client sent a different‐channel header—ignore it */
                     }
                 }
-                if (--nready <= 0) break;
             }
+
+            if (--nready <= 0) break;
         }
     }
 
-    /* never reached, but for completeness: */
     cleanup();
     return 0;
 }

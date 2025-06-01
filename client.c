@@ -41,7 +41,7 @@ int main_client(const char *host, const char *port_str) {
         close(sockfd);
         return EXIT_FAILURE;
     }
-    /* Send the username as the very first line */
+    /* Send the username line first */
     if (write(sockfd, namebuf, namelen) != (ssize_t)namelen ||
         write(sockfd, "\n", 1) != 1) {
         perror("write username");
@@ -49,10 +49,13 @@ int main_client(const char *host, const char *port_str) {
         return EXIT_FAILURE;
     }
 
-    fprintf(stdout, "Connected to %s:%s as '%s'.\n",
+    fprintf(stdout, "Connected to %s:%s as '%s' (channel=general).\n",
             host, port_str, namebuf);
 
-    /* 3) Enter select() loop, watching both stdin and the server socket */
+    /* 3) All clients start in channel “general” */
+    const char *current_channel = "general";
+
+    /* 4) Enter select() loop, watching stdin + server‐socket */
     FD_ZERO(&allset);
     FD_SET(STDIN_FILENO, &allset);
     FD_SET(sockfd,       &allset);
@@ -84,17 +87,32 @@ int main_client(const char *host, const char *port_str) {
 
         /* --- Data from stdin --- */
         if (FD_ISSET(STDIN_FILENO, &rset)) {
-            char buf[MAXLINE];
-            if (fgets(buf, sizeof buf, stdin) == NULL) {
-                /* EOF on stdin (Ctrl+D) => quit */
+            char linebuf[MAXLINE];
+            if (fgets(linebuf, sizeof linebuf, stdin) == NULL) {
+                /* EOF (Ctrl+D) → quit */
                 break;
             }
-            size_t len = strlen(buf);
-            if (len > 0) {
-                if (write(sockfd, buf, len) != (ssize_t)len) {
-                    perror("write to server");
-                    break;
-                }
+            size_t linelen = strlen(linebuf);
+            if (linelen > 0 && linebuf[linelen - 1] == '\n') {
+                linebuf[linelen - 1] = '\0';
+                linelen--;
+            }
+            if (linelen == 0) {
+                continue; /* empty line → ignore */
+            }
+
+            /* Build “<channel>:<message>\n” */
+            char sendbuf[MAXLINE];
+            int  m = snprintf(
+                sendbuf, sizeof sendbuf,
+                "%s:%s\n", current_channel, linebuf
+            );
+            if (m < 0) m = 0;
+            if (m >= (int)sizeof sendbuf) m = (int)sizeof sendbuf - 1;
+
+            if (write(sockfd, sendbuf, m) != m) {
+                perror("write to server");
+                break;
             }
         }
     }
