@@ -15,6 +15,7 @@
 
 #define MAXLINE 512
 #define MAXCLIENTS  FD_SETSIZE
+#define MAXNAME 32
 
 static void fatal(const char *msg) {
     perror(msg);
